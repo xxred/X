@@ -7,7 +7,7 @@ trigger:
 - master
 
 pool:
-  vmImage: 'win1803'
+  vmImage: 'Hosted VS2017'
 
 variables:
   buildConfiguration: 'Release'
