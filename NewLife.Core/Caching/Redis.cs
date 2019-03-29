@@ -20,19 +20,22 @@ namespace NewLife.Caching
             ObjectContainer.Current.AutoRegister<Redis, Redis>();
         }
 
-        /// <summary>创建</summary>
-        /// <param name="server"></param>
-        /// <param name="db"></param>
+        /// <summary>创建指定服务器的实例</summary>
+        /// <param name="server">服务器地址。支持前面加上密码，@分隔</param>
+        /// <param name="db">使用的数据库</param>
         /// <returns></returns>
         public static Redis Create(String server, Int32 db)
         {
             if (server.IsNullOrEmpty() || server == ".") server = "127.0.0.1";
 
             var pass = "";
-            if (server.Contains("@"))
+
+            // 从后面开始找，密码可能带有@
+            var p = server.LastIndexOf('@');
+            if (p >= 0)
             {
-                pass = server.Substring(null, "@");
-                server = server.Substring("@", null);
+                pass = server.Substring(0, p);
+                server = server.Substring(p + 1);
             }
             //适配多种配置连接字符
             else if (server.Contains(";") && pass.IsNullOrEmpty())
@@ -47,6 +50,30 @@ namespace NewLife.Caching
             rds.Server = server;
             rds.Password = pass;
             rds.Db = db;
+
+            // 执行初始化
+            rds.Init(null);
+
+            return rds;
+        }
+
+        /// <summary>创建指定服务器的实例，支持密码</summary>
+        /// <param name="server">服务器地址。支持前面加上密码，@分隔</param>
+        /// <param name="password">密码</param>
+        /// <param name="db">使用的数据库</param>
+        /// <returns></returns>
+        public static Redis Create(String server, String password, Int32 db)
+        {
+            if (server.IsNullOrEmpty() || server == ".") server = "127.0.0.1";
+
+            // 借助对象容器，支持外部注入Redis实现
+            var rds = ObjectContainer.Current.Resolve<Redis>();
+            rds.Server = server;
+            rds.Password = password;
+            rds.Db = db;
+
+            // 执行初始化
+            rds.Init(null);
 
             return rds;
         }
@@ -161,6 +188,14 @@ namespace NewLife.Caching
 
                 return rc;
             }
+
+            protected override Boolean OnGet(RedisClient value)
+            {
+                // 借出时清空残留
+                value?.Reset();
+
+                return base.OnGet(value);
+            }
         }
 
         private MyPool _Pool;
@@ -192,10 +227,11 @@ namespace NewLife.Caching
 
         /// <summary>执行命令</summary>
         /// <typeparam name="TResult">返回类型</typeparam>
+        /// <param name="key">命令key，用于选择集群节点</param>
         /// <param name="func">回调函数</param>
         /// <param name="write">是否写入操作</param>
         /// <returns></returns>
-        public virtual TResult Execute<TResult>(Func<RedisClient, TResult> func, Boolean write = false)
+        public virtual TResult Execute<TResult>(String key, Func<RedisClient, TResult> func, Boolean write = false)
         {
             // 写入或完全管道模式时，才处理管道操作
             if (write || FullPipeline)
@@ -210,7 +246,7 @@ namespace NewLife.Caching
                     // 命令数足够，自动提交
                     if (AutoPipeline > 0 && rds.PipelineCommands >= AutoPipeline)
                     {
-                        StopPipeline();
+                        StopPipeline(true);
                         StartPipeline();
                     }
 
@@ -254,6 +290,7 @@ namespace NewLife.Caching
             if (rds == null)
             {
                 rds = Pool.Get();
+                rds.Reset();
                 rds.StartPipeline();
 
                 _client.Value = rds;
@@ -277,6 +314,9 @@ namespace NewLife.Caching
             }
             finally
             {
+                // 如果不需要结果，则暂停一会，有效清理残留
+                if (!requireResult) Thread.Sleep(1);
+
                 rds.Reset();
                 Pool.Put(rds);
             }
@@ -286,7 +326,7 @@ namespace NewLife.Caching
         /// <returns></returns>
         public override Int32 Commit()
         {
-            var rs = StopPipeline();
+            var rs = StopPipeline(true);
             if (rs == null) return 0;
 
             return rs.Length;
@@ -340,37 +380,37 @@ namespace NewLife.Caching
             if (expire < 0) expire = Expire;
 
             if (expire <= 0)
-                return Execute(rds => rds.Execute<String>("SET", key, value) == "OK", true);
+                return Execute(key, rds => rds.Execute<String>("SET", key, value) == "OK", true);
             else
-                return Execute(rds => rds.Execute<String>("SETEX", key, expire, value) == "OK", true);
+                return Execute(key, rds => rds.Execute<String>("SETEX", key, expire, value) == "OK", true);
         }
 
         /// <summary>获取单体</summary>
         /// <param name="key">键</param>
-        public override T Get<T>(String key) => Execute(rds => rds.Execute<T>("GET", key));
+        public override T Get<T>(String key) => Execute(key,rds => rds.Execute<T>("GET", key));
 
         /// <summary>批量移除缓存项</summary>
         /// <param name="keys">键集合</param>
-        public override Int32 Remove(params String[] keys) => Execute(rds => rds.Execute<Int32>("DEL", keys), true);
+        public override Int32 Remove(params String[] keys) => Execute(keys.FirstOrDefault(), rds => rds.Execute<Int32>("DEL", keys), true);
 
         /// <summary>清空所有缓存项</summary>
-        public override void Clear() => Execute(rds => rds.Execute<String>("FLUSHDB"), true);
+        public override void Clear() => Execute(null, rds => rds.Execute<String>("FLUSHDB"), true);
 
         /// <summary>是否存在</summary>
         /// <param name="key">键</param>
-        public override Boolean ContainsKey(String key) => Execute(rds => rds.Execute<Int32>("EXISTS", key) > 0);
+        public override Boolean ContainsKey(String key) => Execute(key, rds => rds.Execute<Int32>("EXISTS", key) > 0);
 
         /// <summary>设置缓存项有效期</summary>
         /// <param name="key">键</param>
         /// <param name="expire">过期时间</param>
-        public override Boolean SetExpire(String key, TimeSpan expire) => Execute(rds => rds.Execute<String>("EXPIRE", key, (Int32)expire.TotalSeconds) == "1", true);
+        public override Boolean SetExpire(String key, TimeSpan expire) => Execute(key, rds => rds.Execute<String>("EXPIRE", key, (Int32)expire.TotalSeconds) == "1", true);
 
         /// <summary>获取缓存项有效期</summary>
         /// <param name="key">键</param>
         /// <returns></returns>
         public override TimeSpan GetExpire(String key)
         {
-            var sec = Execute(rds => rds.Execute<Int32>("TTL", key));
+            var sec = Execute(key, rds => rds.Execute<Int32>("TTL", key));
             return TimeSpan.FromSeconds(sec);
         }
         #endregion
@@ -380,7 +420,7 @@ namespace NewLife.Caching
         /// <typeparam name="T"></typeparam>
         /// <param name="keys"></param>
         /// <returns></returns>
-        public override IDictionary<String, T> GetAll<T>(IEnumerable<String> keys) => Execute(rds => rds.GetAll<T>(keys));
+        public override IDictionary<String, T> GetAll<T>(IEnumerable<String> keys) => Execute(keys.FirstOrDefault(), rds => rds.GetAll<T>(keys));
 
         /// <summary>批量设置缓存项</summary>
         /// <typeparam name="T"></typeparam>
@@ -388,9 +428,21 @@ namespace NewLife.Caching
         /// <param name="expire">过期时间，秒。小于0时采用默认缓存时间<seealso cref="Cache.Expire"/></param>
         public override void SetAll<T>(IDictionary<String, T> values, Int32 expire = -1)
         {
+            if (values == null || values.Count == 0) return;
+
             if (expire < 0) expire = Expire;
 
-            Execute(rds => rds.SetAll(values), true);
+            // 优化少量读取
+            if (values.Count <= 2)
+            {
+                foreach (var item in values)
+                {
+                    Set(item.Key, item.Value, expire);
+                }
+                return;
+            }
+
+            Execute(values.FirstOrDefault().Key, rds => rds.SetAll(values), true);
 
             // 使用管道批量设置过期时间
             if (expire > 0)
@@ -407,7 +459,7 @@ namespace NewLife.Caching
                 }
                 finally
                 {
-                    StopPipeline();
+                    StopPipeline(true);
                 }
             }
         }
@@ -425,9 +477,9 @@ namespace NewLife.Caching
             if (expire < 0) expire = Expire;
 
             if (expire <= 0)
-                return Execute(rds => rds.Execute<Int32>("SETNX", key, value) == 1, true);
+                return Execute(key, rds => rds.Execute<Int32>("SETNX", key, value) == 1, true);
             else
-                return Execute(rds => rds.Execute<Int32>("SETNX", key, value, expire) == 1, true);
+                return Execute(key, rds => rds.Execute<Int32>("SETNX", key, value, expire) == 1, true);
         }
 
         /// <summary>设置新值并获取旧值，原子操作</summary>
@@ -435,7 +487,7 @@ namespace NewLife.Caching
         /// <param name="key">键</param>
         /// <param name="value">值</param>
         /// <returns></returns>
-        public override T Replace<T>(String key, T value) => Execute(rds => rds.Execute<T>("GETSET", key, value), true);
+        public override T Replace<T>(String key, T value) => Execute(key, rds => rds.Execute<T>("GETSET", key, value), true);
 
         /// <summary>累加，原子操作</summary>
         /// <param name="key">键</param>
@@ -444,16 +496,16 @@ namespace NewLife.Caching
         public override Int64 Increment(String key, Int64 value)
         {
             if (value == 1)
-                return Execute(rds => rds.Execute<Int64>("INCR", key), true);
+                return Execute(key, rds => rds.Execute<Int64>("INCR", key), true);
             else
-                return Execute(rds => rds.Execute<Int64>("INCRBY", key, value), true);
+                return Execute(key, rds => rds.Execute<Int64>("INCRBY", key, value), true);
         }
 
         /// <summary>累加，原子操作，乘以100后按整数操作</summary>
         /// <param name="key">键</param>
         /// <param name="value">变化量</param>
         /// <returns></returns>
-        public override Double Increment(String key, Double value) => Execute(rds => rds.Execute<Double>("INCRBYFLOAT", key, value), true);
+        public override Double Increment(String key, Double value) => Execute(key, rds => rds.Execute<Double>("INCRBYFLOAT", key, value), true);
 
         /// <summary>递减，原子操作</summary>
         /// <param name="key">键</param>
@@ -462,9 +514,9 @@ namespace NewLife.Caching
         public override Int64 Decrement(String key, Int64 value)
         {
             if (value == 1)
-                return Execute(rds => rds.Execute<Int64>("DECR", key), true);
+                return Execute(key, rds => rds.Execute<Int64>("DECR", key), true);
             else
-                return Execute(rds => rds.Execute<Int64>("DECRBY", key, value.ToString()), true);
+                return Execute(key, rds => rds.Execute<Int64>("DECRBY", key, value.ToString()), true);
         }
 
         /// <summary>递减，原子操作，乘以100后按整数操作</summary>

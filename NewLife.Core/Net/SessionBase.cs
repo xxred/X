@@ -16,6 +16,9 @@ namespace NewLife.Net
     public abstract class SessionBase : DisposeBase, ISocketClient, ITransport
     {
         #region 属性
+        /// <summary>标识</summary>
+        public Int32 ID { get; internal set; }
+
         /// <summary>名称</summary>
         public String Name { get; set; }
 
@@ -64,6 +67,7 @@ namespace NewLife.Net
 
         /// <summary>缓冲区大小。默认8k</summary>
         public Int32 BufferSize { get; set; }
+
         #endregion
 
         #region 构造
@@ -105,38 +109,48 @@ namespace NewLife.Net
             if (Disposed) throw new ObjectDisposedException(GetType().Name);
 
             if (Active) return true;
-
-            LogPrefix = "{0}.".F((Name + "").TrimEnd("Server", "Session", "Client"));
-
-            BufferSize = Setting.Current.BufferSize;
-
-            // 估算完成时间，执行过长时提示
-            using (var tc = new TimeCost(GetType().Name + ".Open", 1500))
+            lock (this)
             {
-                tc.Log = Log;
+                if (Active) return true;
 
-                _RecvCount = 0;
-                Active = OnOpen();
-                if (!Active) return false;
+                LogPrefix = "{0}.".F((Name + "").TrimEnd("Server", "Session", "Client"));
 
-                if (Timeout > 0) Client.ReceiveTimeout = Timeout;
+                BufferSize = Setting.Current.BufferSize;
 
-                if (!Local.IsUdp)
+                // 估算完成时间，执行过长时提示
+                using (var tc = new TimeCost(GetType().Name + ".Open", 1500))
                 {
-                    // 管道
-                    var pp = Pipeline;
-                    pp?.Open(CreateContext(this));
+                    tc.Log = Log;
+
+                    _RecvCount = 0;
+                    var rs = OnOpen();
+                    if (!rs) return false;
+
+                    var timeout = Timeout;
+                    if (timeout > 0)
+                    {
+                        Client.SendTimeout = timeout;
+                        Client.ReceiveTimeout = timeout;
+                    }
+
+                    if (!Local.IsUdp)
+                    {
+                        // 管道
+                        var pp = Pipeline;
+                        pp?.Open(CreateContext(this));
+                    }
                 }
+                Active = true;
+
+                // 统计
+                if (StatSend == null) StatSend = new PerfCounter();
+                if (StatReceive == null) StatReceive = new PerfCounter();
+
+                ReceiveAsync();
+
+                // 触发打开完成的事件
+                Opened?.Invoke(this, EventArgs.Empty);
             }
-
-            // 统计
-            if (StatSend == null) StatSend = new PerfCounter();
-            if (StatReceive == null) StatReceive = new PerfCounter();
-
-            ReceiveAsync();
-
-            // 触发打开完成的事件
-            Opened?.Invoke(this, EventArgs.Empty);
 
             return true;
         }
@@ -161,22 +175,29 @@ namespace NewLife.Net
         public virtual Boolean Close(String reason)
         {
             if (!Active) return true;
+            lock (this)
+            {
+                if (!Active) return true;
 
-            // 管道
-            var pp = Pipeline;
-            pp?.Close(CreateContext(this), reason);
+                // 管道
+                var pp = Pipeline;
+                pp?.Close(CreateContext(this), reason);
 
-            if (OnClose(reason ?? (GetType().Name + "Close"))) Active = false;
+                var rs = true;
+                if (OnClose(reason ?? (GetType().Name + "Close"))) rs = false;
 
-            _RecvCount = 0;
+                _RecvCount = 0;
 
-            // 触发关闭完成的事件
-            Closed?.Invoke(this, EventArgs.Empty);
+                // 触发关闭完成的事件
+                Closed?.Invoke(this, EventArgs.Empty);
 
-            // 如果是动态端口，需要清零端口
-            if (DynamicPort) Port = 0;
+                // 如果是动态端口，需要清零端口
+                if (DynamicPort) Port = 0;
 
-            return !Active;
+                Active = rs;
+
+                return !rs;
+            }
         }
 
         /// <summary>关闭</summary>
@@ -336,52 +357,59 @@ namespace NewLife.Net
         /// <param name="se"></param>
         void ProcessEvent(SocketAsyncEventArgs se)
         {
-            if (!Active)
+            try
             {
-                ReleaseRecv(se, "!Active " + se.SocketError);
-                return;
-            }
-
-            // 判断成功失败
-            if (se.SocketError != SocketError.Success)
-            {
-                // 未被关闭Socket时，可以继续使用
-                if (OnReceiveError(se))
+                if (!Active)
                 {
-                    var ex = se.GetException();
-                    if (ex != null) OnError("ReceiveAsync", ex);
-
-                    ReleaseRecv(se, "SocketError " + se.SocketError);
-
+                    ReleaseRecv(se, "!Active " + se.SocketError);
                     return;
                 }
-            }
-            else
-            {
-                var ep = se.RemoteEndPoint as IPEndPoint ?? Remote.EndPoint;
 
-                var pk = new Packet(se.Buffer, se.Offset, se.BytesTransferred);
-                if (ProcessAsync)
+                // 判断成功失败
+                if (se.SocketError != SocketError.Success)
                 {
-                    // 拷贝走数据，参数要重复利用
-                    pk = pk.Clone();
-                    // 根据不信任用户原则，这里另外开线程执行用户逻辑
-                    // 有些用户在处理数据时，又发送数据并等待响应
-                    ThreadPoolX.QueueUserWorkItem(() => ProcessReceive(pk, ep));
+                    // 未被关闭Socket时，可以继续使用
+                    if (OnReceiveError(se))
+                    {
+                        var ex = se.GetException();
+                        if (ex != null) OnError("ReceiveAsync", ex);
+
+                        ReleaseRecv(se, "SocketError " + se.SocketError);
+
+                        return;
+                    }
                 }
                 else
                 {
-                    // 同步执行，直接使用数据，不需要拷贝
-                    // 直接在IO线程调用业务逻辑
-                    ProcessReceive(pk, ep);
-                }
-            }
+                    var ep = se.RemoteEndPoint as IPEndPoint ?? Remote.EndPoint;
 
-            // 开始新的监听
-            if (Active && !Disposed)
-                ReceiveAsync(se, true);
-            else
-                ReleaseRecv(se, "!Active || Disposed");
+                    var pk = new Packet(se.Buffer, se.Offset, se.BytesTransferred);
+                    if (ProcessAsync)
+                    {
+                        // 拷贝走数据，参数要重复利用
+                        pk = pk.Clone();
+                        // 根据不信任用户原则，这里另外开线程执行用户逻辑
+                        // 有些用户在处理数据时，又发送数据并等待响应
+                        ThreadPoolX.QueueUserWorkItem(() => ProcessReceive(pk, ep));
+                    }
+                    else
+                    {
+                        // 同步执行，直接使用数据，不需要拷贝
+                        // 直接在IO线程调用业务逻辑
+                        ProcessReceive(pk, ep);
+                    }
+                }
+
+                // 开始新的监听
+                if (Active && !Disposed)
+                    ReceiveAsync(se, true);
+                else
+                    ReleaseRecv(se, "!Active || Disposed");
+            }
+            catch (Exception ex)
+            {
+                XTrace.WriteException(ex);
+            }
         }
 
         /// <summary>接收预处理，粘包拆包</summary>
@@ -401,7 +429,7 @@ namespace NewLife.Net
 
                 if (Local.IsTcp) remote = Remote.EndPoint;
 
-                var e = new ReceivedEventArgs(pk) { Remote = remote };
+                var e = new ReceivedEventArgs { Packet = pk, Remote = remote };
 
                 // 不管Tcp/Udp，都在这使用管道
                 var pp = Pipeline;
